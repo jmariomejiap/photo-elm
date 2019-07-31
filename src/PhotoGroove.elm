@@ -4,12 +4,11 @@ import Array exposing (Array)
 import Browser
 import Html exposing (..)
 import Html.Attributes exposing (..)
-import Html.Events exposing (onClick, onMouseOver)
+import Html.Events exposing (onClick)
+import Http
+import Json.Decode exposing (Decoder, bool, int, list, string, succeed)
+import Json.Decode.Pipeline exposing (optional, required)
 import Random
-
-
-
--- helper function
 
 
 urlPrefix : String
@@ -20,45 +19,49 @@ urlPrefix =
 type Msg
     = ClickedPhoto String
     | ClickedSize ThumbnailSize
-    | GotSelectedIndex Int
     | ClickedSurpriseMe
-
-
-
-{-
-   the view returns Html markup. by passign the model we connect the "state"
-   of the application with the markup.
--}
+    | GotRandomPhoto Photo
+    | GotPhotos (Result Http.Error (List Photo))
 
 
 view : Model -> Html Msg
 view model =
-    div [ class "content" ]
-        [ h1 [] [ text "Photo Groove" ]
-        , button [ onClick ClickedSurpriseMe ] [ text "Surprise Me!" ]
-        , h3 [] [ text "Thumbnail Size:" ]
-        , div [ id "choose-size" ] (List.map viewSizeChooser [ Small, Medium, Large ])
-        , div [ id "thumbnails", class (sizeToString model.chosenSize) ]
-            (List.map (viewThumbnail model.selectedUrl) model.photos)
-        , img
-            [ class "large"
-            , src (urlPrefix ++ "large/" ++ model.selectedUrl)
-            ]
-            []
+    div [ class "content" ] <|
+        case model.status of
+            Loaded photos selectedUrl ->
+                viewLoaded photos selectedUrl model.chosenSize
+
+            Loading ->
+                []
+
+            Errored errorMessage ->
+                [ text ("Error: " ++ errorMessage) ]
+
+
+viewLoaded : List Photo -> String -> ThumbnailSize -> List (Html Msg)
+viewLoaded photos selectedUrl chosenSize =
+    [ h1 [] [ text "Photo Groove" ]
+    , button
+        [ onClick ClickedSurpriseMe ]
+        [ text "Surprise Me!" ]
+    , h3 [] [ text "Thumbnail Size:" ]
+    , div [ id "choose-size" ]
+        (List.map viewSizeChooser [ Small, Medium, Large ])
+    , div [ id "thumbnails", class (sizeToString chosenSize) ]
+        (List.map (viewThumbnail selectedUrl) photos)
+    , img
+        [ class "large"
+        , src (urlPrefix ++ "large/" ++ selectedUrl)
         ]
-
-
-
-{-
-   helper function, which renders a single thumbnail as Html
-   Partially Applied function (curried)
--}
+        []
+    ]
 
 
 viewThumbnail : String -> Photo -> Html Msg
 viewThumbnail selectedUrl thumb =
     img
         [ src (urlPrefix ++ thumb.url)
+        , title (thumb.title ++ " [" ++ String.fromInt thumb.size ++ " KB]")
         , classList [ ( "selected", selectedUrl == thumb.url ) ]
         , onClick (ClickedPhoto thumb.url)
         ]
@@ -67,8 +70,8 @@ viewThumbnail selectedUrl thumb =
 
 viewSizeChooser : ThumbnailSize -> Html Msg
 viewSizeChooser size =
-    label [ onClick (ClickedSize size) ]
-        [ input [ type_ "radio", name "size", onMouseOver (ClickedSize size) ] []
+    label []
+        [ input [ type_ "radio", name "size", onClick (ClickedSize size) ] []
         , text (sizeToString size)
         ]
 
@@ -92,80 +95,112 @@ type ThumbnailSize
     | Large
 
 
-chosenSize : ThumbnailSize
-chosenSize =
-    Small
-
-
 type alias Photo =
-    { url : String }
+    { url : String
+    , size : Int
+    , title : String
+    }
+
+
+photoDecoder : Decoder Photo
+photoDecoder =
+    -- succeed buildPhoto
+    succeed Photo
+        |> required "url" string
+        |> required "size" int
+        |> optional "title" string "(untitled)"
+
+
+type Status
+    = Loading
+    | Loaded (List Photo) String
+    | Errored String
 
 
 type alias Model =
-    { photos : List Photo
-    , selectedUrl : String
+    { status : Status
     , chosenSize : ThumbnailSize
     }
 
 
 initialModel : Model
 initialModel =
-    { photos =
-        [ { url = "1.jpeg" }
-        , { url = "2.jpeg" }
-        , { url = "3.jpeg" }
-        ]
-    , selectedUrl = "1.jpeg"
+    { status = Loading
     , chosenSize = Medium
     }
-
-
-photoArray : Array Photo
-photoArray =
-    Array.fromList initialModel.photos
-
-
-getPhotoUrl : Int -> String
-getPhotoUrl index =
-    case Array.get index photoArray of
-        Just photo ->
-            photo.url
-
-        Nothing ->
-            ""
-
-
-randomPhotoPicker =
-    Random.int 0 (Array.length photoArray - 1)
-
-
-
-{-
-   hooks up our view to the model "state"
--}
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
+        GotRandomPhoto photo ->
+            ( { model | status = selectUrl photo.url model.status }, Cmd.none )
+
         ClickedPhoto url ->
-            ( { model | selectedUrl = url }, Cmd.none )
+            ( { model | status = selectUrl url model.status }, Cmd.none )
 
         ClickedSize size ->
             ( { model | chosenSize = size }, Cmd.none )
 
         ClickedSurpriseMe ->
-            ( model, Random.generate GotSelectedIndex randomPhotoPicker )
+            case model.status of
+                -- How can we have two brances with the same case?
+                Loaded (firstPhoto :: otherPhotos) _ ->
+                    Random.uniform firstPhoto otherPhotos
+                        |> Random.generate GotRandomPhoto
+                        |> Tuple.pair model
 
-        GotSelectedIndex index ->
-            ( { model | selectedUrl = getPhotoUrl index }, Cmd.none )
+                Loaded [] _ ->
+                    ( model, Cmd.none )
+
+                Loading ->
+                    ( model, Cmd.none )
+
+                Errored errorMessage ->
+                    ( model, Cmd.none )
+
+        GotPhotos (Ok photos) ->
+            case photos of
+                first :: rest ->
+                    ( { model | status = Loaded photos first.url }
+                    , Cmd.none
+                    )
+
+                [] ->
+                    ( { model | status = Errored "0 photos found" }
+                    , Cmd.none
+                    )
+
+        GotPhotos (Err httpError) ->
+            ( { model | status = Errored "Server error!" }, Cmd.none )
+
+
+selectUrl : String -> Status -> Status
+selectUrl url status =
+    case status of
+        Loaded photos _ ->
+            Loaded photos url
+
+        Loading ->
+            status
+
+        Errored errorMessage ->
+            status
+
+
+initialCmd : Cmd Msg
+initialCmd =
+    Http.get
+        { url = "http://elm-in-action.com/photos/list.json"
+        , expect = Http.expectJson GotPhotos (list photoDecoder)
+        }
 
 
 main : Program () Model Msg
 main =
     Browser.element
-        { init = \flags -> ( initialModel, Cmd.none )
+        { init = \flags -> ( initialModel, initialCmd )
         , view = view
         , update = update
-        , subscriptions = \model -> Sub.none
+        , subscriptions = \_ -> Sub.none
         }
